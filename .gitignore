@@ -4,3 +4,5 @@
 *.suo
 *.cache
 *.log
+/x64
+/SSHPass/x64
