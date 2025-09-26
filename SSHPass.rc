@@ -1,8 +1,6 @@
 // Microsoft Visual C++ generated resource script.
 //
 #include "resource.h"
-#include <windows.h>
-
 /////////////////////////////////////////////////////////////////////////////
 // English (United States) resources
 
@@ -57,11 +55,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "TODO: <Company name>"
-            VALUE "FileDescription", "TODO: <File description>"
+            VALUE "CompanyName", "GitHub Licensed Code"
+            VALUE "FileDescription", "SSHPass - supply password to SSH.EXE or SCP.exe (and the like) in a command window"
             VALUE "FileVersion", "2.0.0.0"
             VALUE "InternalName", "SSHPass.exe"
-            VALUE "LegalCopyright", "Copyright (C) 2025"
+            VALUE "LegalCopyright", "Copyright (C) 2023 xhcoding, and Copyright (C) 2025 MainframeDaze"
             VALUE "OriginalFilename", "SSHPass.exe"
             VALUE "ProductName", "TODO: <Product name>"
             VALUE "ProductVersion", "2.0.0.0"
