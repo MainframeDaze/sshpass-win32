@@ -4,5 +4,6 @@
 *.suo
 *.cache
 *.log
-/x64
-/SSHPass/x64
+x64/
+Release/
+Debug/
