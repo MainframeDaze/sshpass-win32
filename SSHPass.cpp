@@ -16,7 +16,11 @@
 *   Changed handling of CreateProceesA() command line to NOT add a trailing blank
 * 
 * v2.0.1.0  11/30/2025
-* Comment out "WFMO result" output
+* Comment out "WFMO result" output. DIsconnected from original fork because I did not want to merge Unicode and other changes
+* 
+* v2.0.2.0  11/30/2025
+* Updated InputHandlerThread() to set ENABLE_VIRTUAL_TERMINAL_INPUT as per original branch. If CreatePseudoConsoleAndPipes() fails, we not only print the error code, we
+* also return it as our result.
 * 
 ***********************************************************************/
 #include <Windows.h>
@@ -100,7 +104,7 @@ int main(int argc, const char* argv[]) {
 
     HPCON hpcon = INVALID_HANDLE_VALUE;
 
-    hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);
+    hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);     // if this fails, GetLastError() has the error code
     if (S_OK == hr) {
         HANDLE pipeListener = (HANDLE)_beginthread(PipeListener, 0, &ctx);
 
@@ -189,8 +193,9 @@ int main(int argc, const char* argv[]) {
     }
     else
     {
-        // Pipe and/or pseudoconsole creation failed
-        fprintf(stderr, "CreatePseudoCOnsoleAndPipes() failed, rc = %i", GetLastError());
+        // Pipe and/or pseudoconsole creation failed. hr != S_OK
+        childExitCode = GetLastError();
+        fprintf(stderr, "CreatePseudoConsoleAndPipes() failed, rc = %i", childExitCode);
     }
     return S_OK == hr ? childExitCode : EXIT_FAILURE;
 }
@@ -565,13 +570,16 @@ static void WritePass(Context* ctx) {
     }
 }
 
+// This is the Thread that we run with STDIN and STDOUT redirected. We loop, reading output and writing input on character at a time until there is an error (or we are terminated)
 static void __cdecl InputHandlerThread(LPVOID arg) {
     Context* ctx = (Context*)arg;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode;
 
-    GetConsoleMode(hStdin, &mode);
-    SetConsoleMode(hStdin, (mode & ~ENABLE_LINE_INPUT) & ~ENABLE_ECHO_INPUT);
+    GetConsoleMode(hStdin, &mode);                      // current console mode
+    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);   // turn off ENABLE_LINE_INPUT & ENABLE_ECHO_INPUT
+    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;              // turn on ENABLE_VIRTUAL_TERMINAL_INPUT
+    SetConsoleMode(hStdin, mode);
 
     char buffer = 0;
     DWORD bytesRead, bytesWritten;
