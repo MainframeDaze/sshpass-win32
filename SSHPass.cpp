@@ -15,6 +15,9 @@
 *   Used pragmas to ensure getenv() is not flagged and to ensure Kernel structures are packed on the BYTE boundary
 *   Changed handling of CreateProceesA() command line to NOT add a trailing blank
 * 
+* v2.0.1.0  11/30/2025
+* Comment out "WFMO result" output
+* 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -149,9 +152,9 @@ int main(int argc, const char* argv[]) {
                 while (d == WAIT_TIMEOUT)
                 {
                     d = WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE, INFINITE); // wait 1 minute
-                    if (d == WAIT_TIMEOUT)
+                    if (d == WAIT_TIMEOUT)  // This never happens now because wait is INFINITE
                         d = WAIT_TIMEOUT;   // use to trap on debug
-                    fprintf(stderr, "WFMO result %i\n", d);
+                    //fprintf(stderr, "WFMO result %i\n", d);
                 }
 
                 if (GetExitCodeProcess(cmdProc.hProcess, (LPDWORD)&childExitCode) == 0)
