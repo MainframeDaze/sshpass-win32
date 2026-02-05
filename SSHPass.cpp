@@ -23,7 +23,7 @@
 * also return it as our result.
 * 
 * V2.0.3.0  2/4/2026
-* Crunched codebase with CoPoilot, found several issues and fixed them:
+* Crunched codebase with CoPoilot, found several issues and fixed them. Also added a bunch of comments to help me remember how this works. CoPilot-assisted changes:
 * 
  * - Threading
  *   - Replaced use of CRT-only `_beginthread()` with `_beginthreadex()` so callers receive a
@@ -141,6 +141,8 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
 static unsigned __stdcall PipeListener(LPVOID);
 static unsigned __stdcall InputHandlerThread(LPVOID);
 
+// Entry point for the program. Parses command line arguments, sets up the pseudo console and pipes, starts the listener and input handler threads, and waits for the child process to exit before cleaning up and 
+// returning the child's exit code (or an error code if something went wrong). May also return EXIT_FAILURE vs a specific Win32 error code.
 int main(int argc, const char* argv[]) {
     Context ctx;
     uint32_t childExitCode = ERROR_SUCCESS;
@@ -161,17 +163,16 @@ int main(int argc, const char* argv[]) {
     // Allow VT100 ANSI Terminal Escape sequences to be procesed by this console
     DWORD consoleMode = 0;
     if (GetConsoleMode(ctx.stdOut, &consoleMode))
-    {
-        if (SetConsoleMode(ctx.stdOut, consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0)
-            rc = GetLastError();
-    }
-    else
-        rc = GetLastError();
+        (void)SetConsoleMode(ctx.stdOut, consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    // Get whatever error code came from either of the above calls
+    rc = GetLastError();
     if (rc != ERROR_SUCCESS)
+        // Oops... fail if we cannot set the Console Mode as desired
         return rc;
 
     HPCON hpcon = INVALID_HANDLE_VALUE;
 
+	// Create an input and output handle for the PseudoConsole (in <ctx>), and create the PseudoConsole itself; handle returned in hpcon.
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);     // if this fails, GetLastError() has the error code
     if (S_OK == hr) {
         /* start PipeListener using _beginthreadex so we get a real HANDLE we can close */
@@ -190,6 +191,8 @@ int main(int argc, const char* argv[]) {
 
 #pragma pack(push, 1)  // ensure byte alignment for the structure below
         STARTUPINFOEXA startupInfo = { 0 };
+		// Force startupInfo to be bound to the PseudoConsole created above <hpcon>. This is necessary for the child process we create to be attached to that console 
+        // and have its I/O redirected to the pipes we created.
         if (S_OK == InitializeStartupInfoAttachedToPseudoConsole(&startupInfo, hpcon)) {
             PROCESS_INFORMATION cmdProc = { 0 };
 
@@ -249,7 +252,7 @@ int main(int argc, const char* argv[]) {
                 }
                 else if (childExitCode != ERROR_SUCCESS)
                 {
-					fprintf(stderr, "Child process for cmd '%s' exited with code %u\n", ctx.args, childExitCode);
+					fprintf(stderr, "Child process for cmd '%s' exited with code %u\n", ctx.args.cmd, childExitCode);
                 }
             }
 
@@ -393,6 +396,12 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
 
 // Creates a Psuedoconsole with I/O via pipes. Return the console handie in hpcon, pipes in ctx. if RESULT is not S_OK then
 // Error code in GetLastError.
+// hpcon is the handle to the new console
+// ctx is the context struct where we will put the handles for the pipes we create to talk to that console. The pipes passed to
+//        the pseudoconsole are tied to these and "owned" by the pseudoconsole (which is why we close our values of those handles right after creating the console.
+//        The console keeps them alive/owns them and we use the ctx versions to talk to the console). Odd but that is how it works.
+// We return an HRESULT so we can return failure without losing the GetLastError() code which may be important to the caller.
+// 
 static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
     HRESULT hr = E_UNEXPECTED;
     HANDLE pipePtyIn = INVALID_HANDLE_VALUE;
@@ -400,13 +409,16 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
 	BOOL   bPipe1Ok, bPipe2Ok = 0;      // bPike20KOk initialized to 0 to avoid compiler warning
     int     rc = ERROR_SUCCESS;
 
+    // Must create 2 sets of pipes (if we used ctx->pipeOut and pipePtyIn, everything we send to pipePtyIn would come right back out via ctx-PipeOut. We will
+    // discard the pipePtyIn (and pipePtyOut) handle before exiting; these will be STDIN and STDOUT/STDERR for the PsuedoConsole. ctx will have the other handles.
+	// cts->pipeIn is STDOUT/STDERR for the console (read data), ctx->pipeOut is STDIN for the console (write data).
     bPipe1Ok = CreatePipe(&pipePtyIn, &ctx->pipeOut, NULL, 0);
     if (bPipe1Ok)   // do not try second if first failed; preserves Error Code
         bPipe2Ok = CreatePipe(&ctx->pipeIn, &pipePtyOut, NULL, 0);
 
     if (bPipe1Ok && bPipe2Ok)
     {
-        // WHat we do if pipe creation works
+		// Need screen and buffer size to create the console. Get them from the current console, but if that fails use defaults of 120x25
         COORD consoleSize = { 0 };
 
         CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -419,6 +431,7 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
             consoleSize.X = 120;
             consoleSize.Y = 25;
         }
+		// Now create the pseudoconsole with its pipes; handle we use returned in hpcon (which is a POINTER to a handle). 
         hr = CreatePseudoConsole(consoleSize, pipePtyIn, pipePtyOut, 0, hpcon);
         if (hr != S_OK)
             // Save error code so we can restore after cleanup
@@ -457,8 +470,14 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
     return hr;
 }
 
-static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* startupInfo,
-    HPCON hpcon) {
+// Tie the Attribute List in startupInfo to the PseudoConsole we created so that when we do create a process with startupInfo, it is attached to that console and 
+// has its I/O redirected to the pipes we created. If RESULT is not S_OK then call GetLastError() for the error code.
+//
+// If successful, the caller must call HeapFree() on startupInfo->lpAttributeList after calling DeleteProcThreadAttributeList() on it. 
+// If we fail, we free it here because the caller will not be expecting to have to clean up anything on failure.
+//
+static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* startupInfo, HPCON hpcon)
+{
     HRESULT hr = E_UNEXPECTED;
     if (startupInfo == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -468,9 +487,9 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
     SIZE_T attrListSize = 0;
     startupInfo->StartupInfo.cb = sizeof(STARTUPINFOEXA);
 
-    // get required size
+	// get required size for an attribute list with 1 attribute 
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrListSize);
-
+    // Allocate the buffer
     startupInfo->lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrListSize);
     if (startupInfo->lpAttributeList == NULL) {
         SetLastError(ERROR_OUTOFMEMORY);
@@ -485,13 +504,13 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
         SetLastError(err);
         return hr;
     }
-
+	// Attach the PseudoConsole to the attribute list so that it will be used when we create the child process with this startupInfo
     hr = (UpdateProcThreadAttribute(startupInfo->lpAttributeList, 0,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hpcon, sizeof(HPCON), NULL,
         NULL) ? S_OK : E_UNEXPECTED);
 
     if (hr != S_OK) {
-		// Cleanup on failure (caller only cleans up on success)
+		// Cleanup on failure (caller only cleans up on success). These are the same steps caller will need to take to clean things up (Delete List, Free List).
 		DWORD err = GetLastError();
         DeleteProcThreadAttributeList(startupInfo->lpAttributeList);
         HeapFree(GetProcessHeap(), 0, startupInfo->lpAttributeList);
@@ -584,7 +603,20 @@ static BOOL IsWaitInputPass(Context * ctx, char* buffer, DWORD len) {
 
 typedef enum {INIT, VERIFY, EXEC, END } State;
 
-//static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State state) {
+// State-based output processing
+// //
+// ctx = context info for psuedoconsole (PS) process
+// buffer = PS process output to be processed
+// len = length of buffer
+// state = current state of the state machine
+// 
+// RETURNS: new state value
+// 
+// When state is INIT we look for the password prompt. When we see it, we write the password and move to VERIFY. 
+// In VERIFY we look to see if we get the prompt again (which would indicate a bad password) or if we get something else (which would indicate the password was 
+// accepted and we are now getting normal output). If we get the prompt again, we print "Password rejected" and move to END. If we get something else, we print 
+// it and move to EXEC. In EXEC, we just print everything that comes in until the pipe is closed
+//
 static State ProcessOutput(Context * ctx, char* buffer, DWORD len, State state) {
         State nextState;
     switch (state) {
@@ -621,7 +653,8 @@ static State ProcessOutput(Context * ctx, char* buffer, DWORD len, State state) 
     return nextState;
 }
 
-// Wait until we are able to read from the input pipe, then look for the PASSWORD string. When it is seen, 
+// Wait until we are able to read from the input pipe, then process data as it comes in with ProcessOutput(). 
+// Runs in its own thread. Signals through ctx->events[0] when we are done processing (either process ended or we got a password failure and are exiting).
 #define BUFFER_SIZE 1024
 static unsigned __stdcall PipeListener(LPVOID arg) {
     Context* ctx = (Context *)arg;
@@ -637,14 +670,17 @@ static unsigned __stdcall PipeListener(LPVOID arg) {
     while (1) {
         fRead = ReadFile(ctx->pipeIn, buffer, BUFFER_SIZE, &bytesRead, NULL);
         if (!fRead || bytesRead == 0) {
+			// End loop on error or if the pipe is closing (0 bytes read)
             break;
         }
-        buffer[bytesRead] = 0;
+		buffer[bytesRead] = '\0'; // Null terminate the buffer so we can treat it as a string
+		// State-machine based processing of the output. Handles password entry/verification and supsequent output from the process
         state = ProcessOutput(ctx, buffer, bytesRead, state);
         if (state == END) {
             break;
         }
     }
+	// Signal main thread that we are done processing output (either process ended or we got a password failure and are exiting)
     SetEvent(ctx->events[0]);
     return 0;
 }
@@ -702,12 +738,15 @@ static void WritePass(Context* ctx) {
     }
 }
 
-// This is the Thread that we run with STDIN and STDOUT redirected. We loop, reading output and writing input on character at a time until there is an error (or we are terminated)
+// This is the Thread that we run to manage PseudoConsole (PS) input. It waits for input on the console where we launched sshpass, then writes that input to the PS input pipe 
+// so it gets to the process we are running in the PS (e.g. SSH or SCP).
+// argument is a pointer to our Context struct 
 static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     Context* ctx = (Context*)arg;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode, origMode;
 
+    // Set the PS to the mode we want...
     GetConsoleMode(hStdin, &origMode);                  // current console mode
     mode = origMode;                                    // Start with this...
     mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);   // turn off ENABLE_LINE_INPUT & ENABLE_ECHO_INPUT
@@ -717,6 +756,8 @@ static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     char buffer = 0;
     DWORD bytesRead, bytesWritten;
 
+	// Get each keystroke and write it to the PS for processing. This allows the user to interact with the PS process (e.g. SSH or SCP) as if they were directly at a console for that process. 
+    // We keep doing this until we get an error or 0 bytes read which indicates the console input is closing (e.g. user pressed Ctrl+Z or closed the window).
     while (1) {
         if (!ReadFile(hStdin, &buffer, 1, &bytesRead, NULL) || bytesRead == 0) {
             break;
