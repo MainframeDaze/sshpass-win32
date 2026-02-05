@@ -20,7 +20,8 @@
 * 
 * v2.0.2.0  11/30/2025
 * Updated InputHandlerThread() to set ENABLE_VIRTUAL_TERMINAL_INPUT as per original branch. If CreatePseudoConsoleAndPipes() fails, we not only print the error code, we
-* also return it as our result.
+* also return it arun .
+s our result.
 * 
 ***********************************************************************/
 #include <Windows.h>
