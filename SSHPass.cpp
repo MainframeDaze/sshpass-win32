@@ -87,6 +87,11 @@
  *   - Consider adding unit/integration tests that run interactive ssh scenarios (ok/wrong password,
  *     password-from-file, env var) to validate state transitions.
  * 
+ * 
+ * v2.0.4.0  2/5/2026
+ * Added an error message in main() to indicate the PipeListener event could not be creaed (vs. silent exit). Also print error message of
+ * VT100 mode cannot be set.
+ * 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -152,11 +157,14 @@ int main(int argc, const char* argv[]) {
 
     HRESULT hr = E_UNEXPECTED;
 
-    ctx.pipeIn = INVALID_HANDLE_VALUE;
+    ctx.pipeIn = INVALID_HANDLE_VALUE;              // these will be created shortly
     ctx.pipeOut = INVALID_HANDLE_VALUE;
-    ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);   // used to modify the status of the launching console.
+
+    // This event will be used by the PipeListener thread to signal us that it is quitting...
     ctx.events[0] = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (ctx.events[0] == NULL) {
+		fprintf(stderr, "Could not create input thread event: %u\n", GetLastError());
         return EXIT_FAILURE;
     }
 
@@ -167,10 +175,13 @@ int main(int argc, const char* argv[]) {
     // Get whatever error code came from either of the above calls
     rc = GetLastError();
     if (rc != ERROR_SUCCESS)
+    {
         // Oops... fail if we cannot set the Console Mode as desired
+        fprintf(stderr, "Could not set console mode to enable VT processing: %u\n", rc);
         return rc;
+    }
 
-    HPCON hpcon = INVALID_HANDLE_VALUE;
+    HPCON hpcon = INVALID_HANDLE_VALUE;     // this is the PseudoConsole handle
 
 	// Create an input and output handle for the PseudoConsole (in <ctx>), and create the PseudoConsole itself; handle returned in hpcon.
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);     // if this fails, GetLastError() has the error code
@@ -238,6 +249,8 @@ int main(int argc, const char* argv[]) {
                 //
                 while (d == WAIT_TIMEOUT)
                 {
+					// Event 0 comes from PipeListener thread - signals it is ending. Event 1 comes from the child process thread (e.g. SSH or SCP) - signals it is ending. 
+                    // Either way we are quitting...
                     d = WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE, INFINITE); // wait 1 minute
                     if (d == WAIT_TIMEOUT)  // This never happens now because wait is INFINITE
                         d = WAIT_TIMEOUT;   // use to trap on debug
@@ -756,7 +769,7 @@ static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     char buffer = 0;
     DWORD bytesRead, bytesWritten;
 
-	// Get each keystroke and write it to the PS for processing. This allows the user to interact with the PS process (e.g. SSH or SCP) as if they were directly at a console for that process. 
+	// Get each keystroke from the main console window and write it to the PS for processing. This allows the user to interact with the PS process (e.g. SSH or SCP) as if they were directly at a console for that process. 
     // We keep doing this until we get an error or 0 bytes read which indicates the console input is closing (e.g. user pressed Ctrl+Z or closed the window).
     while (1) {
         if (!ReadFile(hStdin, &buffer, 1, &bytesRead, NULL) || bytesRead == 0) {
