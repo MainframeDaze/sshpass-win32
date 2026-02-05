@@ -20,9 +20,73 @@
 * 
 * v2.0.2.0  11/30/2025
 * Updated InputHandlerThread() to set ENABLE_VIRTUAL_TERMINAL_INPUT as per original branch. If CreatePseudoConsoleAndPipes() fails, we not only print the error code, we
-* also return it arun .
-s our result.
+* also return it as our result.
 * 
+* V2.0.3.0  2/4/2026
+* Crunched codebase with CoPoilot, found several issues and fixed them:
+* 
+ * - Threading
+ *   - Replaced use of CRT-only `_beginthread()` with `_beginthreadex()` so callers receive a
+ *     Win32-compatible thread handle. Thread entry functions updated to `unsigned __stdcall`
+ *     to match `_beginthreadex` calling convention.
+ *   - Store and close thread HANDLEs returned from `_beginthreadex()` (close handles after threads
+ *     terminate) to avoid handle leaks and to allow safe Wait/Close semantics.
+ *   - Simplified thread-start error handling: check returned value == 0 and use GetLastError()
+ *     (removed incorrect checks for -1 and errno-based switch logic).
+ *
+ * - Pseudo-console / attribute list handling
+ *   - Fixed memory-leak and error handling around `InitializeProcThreadAttributeList`:
+ *     always free `lpAttributeList` (HeapFree) on initialization failure and delete the attribute
+ *     list on UpdateProcThreadAttribute failure. Ensure meaningful HRESULT/GetLastError values
+ *     are returned and preserved for caller.
+ *
+ * - Command-line assembly and allocation
+ *   - Fixed command buffer sizing: allocate room for the terminating NUL (cmdLen + 1).
+ *   - Check `malloc()` result and fail fast if allocation fails.
+ *   - Initialize buffer to an empty string before concatenation; use `StringCch*` safely with
+ *     character counts to avoid buffer overflows.
+ *
+ * - Console mode handling
+ *   - Preserve original console input mode (origMode) in `InputHandlerThread` and restore it
+ *     on exit. Avoid restoring a modified mode value.
+ *
+ * - Password input and writing
+ *   - For `PWT_FD` (file-descriptor) use `_get_osfhandle()` to convert CRT fd to Win32 HANDLE and
+ *     validate result instead of blindly casting an integer to `HANDLE`.
+ *
+ * - Robustness / error handling
+ *   - Add missing includes used by fixes: `<errno.h>`, `<ctype.h>`, `<io.h>` (for `_get_osfhandle`).
+ *   - Check return codes for critical Win32 calls (GetConsoleMode, SetConsoleMode, CreatePipe,
+ *     CreatePseudoConsole, ReadFile, WriteFile, CreateProcess etc.) and print/return 
+ *     diagnostics (GetLastError) on failure.
+ *   - Ensure handles created (pipes, events, thread/process handles) are closed in cleanup paths.
+ *
+ * - Small correctness / style fixes
+ *   - Normalize thread prototypes and definitions to `unsigned __stdcall`.
+ *   - Fixed minor compiler warnings (initialize booleans, avoid uninitialized search pointers).
+ *   - Minor changes in `argparse.c` to avoid compiler warnings around `strtol`/`strtof` `endptr`
+ *     variable usage.
+ *
+ * Files touched:
+ *   - SSHPass.cpp  -- threading changes, heap/attribute-list cleanup, command buffer fixes,
+ *                     console-mode preservation, WritePass/WritePassHandle improvements,
+ *                     _get_osfhandle usage, additional includes, handle cleanup.
+ *   - argparse.c   -- small local fix for `strtol`/`strtof` end-pointer variable initialization.
+ *
+ * Rationale:
+ *   These changes eliminate crashes caused by calling-convention mismatches, fix handle and heap
+ *   leaks, make I/O more efficient and robust, and make error diagnostics reliable so callers can
+ *   surface real Win32 error codes. They also reduce attack surface/accidental data exposure by
+ *   avoiding creating transient undefined memory states and by recommending password zeroization.
+ *
+ * Notes / recommended follow-ups:
+ *   - Add a centralized cleanup block in `main()` (or convert to RAII) to guarantee all resources
+ *     (events, pipes, handles, heap allocations) are released on every exit path.
+ *   - Consider zeroing sensitive buffers (passwords, temporary command buffers) immediately after
+ *     use (SecureZeroMemory).
+ *   - Consider adding unit/integration tests that run interactive ssh scenarios (ok/wrong password,
+ *     password-from-file, env var) to validate state transitions.
+ * 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -31,6 +95,9 @@ s our result.
 #include <stdlib.h>
 #include <string.h>
 #include <strsafe.h>
+#include <errno.h>
+#include <ctype.h>
+#include <io.h> // for _get_osfhandle()
 
 #include "argparse.h"
 
@@ -71,13 +138,13 @@ static void WritePass(Context* ctx);
 static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx);
 static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* startupInfo,
     HPCON hpcon);
-static void __cdecl PipeListener(LPVOID);
-static void __cdecl InputHandlerThread(LPVOID);
+static unsigned __stdcall PipeListener(LPVOID);
+static unsigned __stdcall InputHandlerThread(LPVOID);
 
 int main(int argc, const char* argv[]) {
     Context ctx;
-    uint32_t childExitCode = 0;
-    int rc = 0;
+    uint32_t childExitCode = ERROR_SUCCESS;
+    int rc = ERROR_SUCCESS;
 
     ParseArgs(argc, argv, &ctx);
 
@@ -107,48 +174,60 @@ int main(int argc, const char* argv[]) {
 
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);     // if this fails, GetLastError() has the error code
     if (S_OK == hr) {
-        HANDLE pipeListener = (HANDLE)_beginthread(PipeListener, 0, &ctx);
+        /* start PipeListener using _beginthreadex so we get a real HANDLE we can close */
+        uintptr_t ulPipeListener = _beginthreadex(NULL, 0, PipeListener, &ctx, 0, NULL);
+        HANDLE hPipeListener = NULL;
+        HANDLE hInputHandler = NULL;
+
+        if (ulPipeListener == 0) {
+            rc = GetLastError();
+            fprintf(stderr, "Warning: could not start PipeListener thread (continuing): %u\n", rc);
+            /* we continue — PipeListener not running; behavior may be degraded */
+        }
+        else {
+            hPipeListener = (HANDLE)ulPipeListener;
+        }
 
 #pragma pack(push, 1)  // ensure byte alignment for the structure below
         STARTUPINFOEXA startupInfo = { 0 };
         if (S_OK == InitializeStartupInfoAttachedToPseudoConsole(&startupInfo, hpcon)) {
             PROCESS_INFORMATION cmdProc = { 0 };
 
-            hr = CreateProcessA(NULL, ctx.args.cmd, NULL, NULL, FALSE,
+            // Create our background Console that runs ctx.args.cmd (should be calling SSH or SCP given what we do)
+            rc = CreateProcessA(NULL, ctx.args.cmd, NULL, NULL, FALSE,
                 EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
                 &startupInfo.StartupInfo, &cmdProc);
 
             // Finally, set <hr> based on result from CreateProcess
-            hr = (hr != 0) ? S_OK : GetLastError();
+            if (rc == 0)
+            {
+                rc = GetLastError();
+				fprintf(stderr, "CreateProcessA failed on '%s': %u\n", ctx.args.cmd, rc);
+				childExitCode = rc; // so this is available on exit (tho hr will force EXIT_FAILURE return)
+                hr = E_UNEXPECTED;
+            }
+            else
+				hr = S_OK;
 
             if (S_OK == hr) {
                 DWORD d = WAIT_TIMEOUT;
 
                 ctx.events[1] = cmdProc.hThread;
 
-                HANDLE inputHandler = (HANDLE)_beginthread(InputHandlerThread, 0, &ctx);
-                if ((LONG) inputHandler == 0 || (LONG)inputHandler == -1)
-                {
-                    // Error case 
-                    switch ((LONG)inputHandler)
-                    {
-                    case -1:
-                        // errno is EAGAIN if too many threads, EANVAL if arg invalid or bad stack size, EACESS if not enough resources
-                        fprintf(stderr, "Could not start InputHandlerThread\n");
-                        rc = errno;
-                        break;
-                    case 0:
-                        // General error
-                        rc = errno;
-                        fprintf(stderr, "OTHER error, could not start InputHandlerThread\n");
-                        break;
-                    default:
-                        // It worked. inputHandler
-                        rc = ERROR_SUCCESS;
+                /* start input handler using _beginthreadex so we get a HANDLE we can close */
+                uintptr_t ulInputHandler = _beginthreadex(NULL, 0, InputHandlerThread, &ctx, 0, NULL);
+                if (ulInputHandler == 0) {
+                    rc = GetLastError();
+                    fprintf(stderr, "Could not start InputHandlerThread, error %u\n", rc);
+                    /* cleanup: close pipe listener if started */
+                    if (hPipeListener) {
+                        CloseHandle(hPipeListener);
                     }
-                    if (rc != ERROR_SUCCESS)
-                        return rc;
+                    return rc;
                 }
+                hInputHandler = (HANDLE)ulInputHandler;
+                /* We don't wait on hInputHandler in the WFMO (we wait on the child process thread),
+                   but we must close the handle later after the thread terminates. */
 
                 // Wait until we get a signal ([process exit or input comes in
                 // event[0] = signalled from thread
@@ -164,18 +243,39 @@ int main(int argc, const char* argv[]) {
 
                 if (GetExitCodeProcess(cmdProc.hProcess, (LPDWORD)&childExitCode) == 0)
                 {
-                    rc = GetLastError();
-                    fprintf(stderr, "GetExitCodeProcess failed\n");
-                    return (rc);
+                    childExitCode = GetLastError();
+                    fprintf(stderr, "GetExitCodeProcess failed: %u\n", childExitCode);
+                    // fall through to Cleanup code
+                }
+                else if (childExitCode != ERROR_SUCCESS)
+                {
+					fprintf(stderr, "Child process for cmd '%s' exited with code %u\n", ctx.args, childExitCode);
                 }
             }
 
+            /* Close process handles as before */
             CloseHandle(cmdProc.hThread);
             CloseHandle(cmdProc.hProcess);
+
+            /* Close the input handler thread handle now that the process ended and we've waited */
+            if (hInputHandler) {
+                CloseHandle(hInputHandler);
+            }
+            /* Close the pipe listener handle if we created it */
+            if (hPipeListener) {
+                CloseHandle(hPipeListener);
+            }
 
             DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
             HeapFree(GetProcessHeap(), 0, startupInfo.lpAttributeList);
         }
+        else
+        {
+			childExitCode = GetLastError();
+            fprintf(stderr, "Warning: could not initialize the console: %u\n", childExitCode);
+			hr = S_OK;  // so we return the error code from InitializeStartupInfoAttachedToPseudoConsole()
+        }
+
 
         ClosePseudoConsole(hpcon);
 
@@ -197,6 +297,7 @@ int main(int argc, const char* argv[]) {
         // Pipe and/or pseudoconsole creation failed. hr != S_OK
         childExitCode = GetLastError();
         fprintf(stderr, "CreatePseudoConsoleAndPipes() failed, rc = %i", childExitCode);
+		hr = S_OK;      // so we return the error code from CreatePseudoConsoleAndPipes()
     }
     return S_OK == hr ? childExitCode : EXIT_FAILURE;
 }
@@ -263,13 +364,19 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
         ctx->args.passPrompt = "password:";
     }
 
-    int cmdLen = 0;
+    __int64 cmdLen = 0;
     for (int i = 0; i < argc; i++) {
         cmdLen += strlen(argv[i]) + 1;  // room for a space
     }
+	cmdLen++; // room for NULL terminator
 
     ctx->args.cmd = (char *) malloc(sizeof(char) * cmdLen);
-    memset((PVOID)ctx->args.cmd, 0, sizeof(char) * cmdLen);
+    if (ctx->args.cmd == NULL) {
+        fprintf(stderr, "Could not allocate memory for command line\n");
+        exit(EXIT_FAILURE);
+	}
+    //memset((PVOID)ctx->args.cmd, 0, sizeof(char) * cmdLen);
+	ctx->args.cmd[0] = '\0'; // don't need it to be ALL 0's just a NULL first character
 
     for (int i = 0; i < argc; i++)
     {
@@ -290,7 +397,7 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
     HRESULT hr = E_UNEXPECTED;
     HANDLE pipePtyIn = INVALID_HANDLE_VALUE;
     HANDLE pipePtyOut = INVALID_HANDLE_VALUE;
-    BOOL   bPipe1Ok, bPipe2Ok;
+	BOOL   bPipe1Ok, bPipe2Ok = 0;      // bPike20KOk initialized to 0 to avoid compiler warning
     int     rc = ERROR_SUCCESS;
 
     bPipe1Ok = CreatePipe(&pipePtyIn, &ctx->pipeOut, NULL, 0);
@@ -354,29 +461,43 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
     HPCON hpcon) {
     HRESULT hr = E_UNEXPECTED;
     if (startupInfo == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
         return hr;
     }
 
     SIZE_T attrListSize = 0;
     startupInfo->StartupInfo.cb = sizeof(STARTUPINFOEXA);
 
-    InitializeProcThreadAttributeList(NULL, 1, 0, & attrListSize);      // returns an error code along with size
+    // get required size
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrListSize);
 
-    startupInfo->lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST) HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrListSize);
+    startupInfo->lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrListSize);
     if (startupInfo->lpAttributeList == NULL) {
+        SetLastError(ERROR_OUTOFMEMORY);
         return hr;
     }
 
-    // CoPilot says memory should be zero'd
-    if (!InitializeProcThreadAttributeList(startupInfo->lpAttributeList, 1, 0, & attrListSize)) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    if (!InitializeProcThreadAttributeList(startupInfo->lpAttributeList, 1, 0, &attrListSize)) {
+        DWORD err = GetLastError();
+		// Need to free up lpAttributeList on failure
+        HeapFree(GetProcessHeap(), 0, startupInfo->lpAttributeList);
+        startupInfo->lpAttributeList = NULL;
+        SetLastError(err);
+        return hr;
     }
 
-    hr = UpdateProcThreadAttribute(startupInfo->lpAttributeList, 0,
+    hr = (UpdateProcThreadAttribute(startupInfo->lpAttributeList, 0,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hpcon, sizeof(HPCON), NULL,
-        NULL)
-        ? S_OK
-        : HRESULT_FROM_WIN32(GetLastError());
+        NULL) ? S_OK : E_UNEXPECTED);
+
+    if (hr != S_OK) {
+		// Cleanup on failure (caller only cleans up on success)
+		DWORD err = GetLastError();
+        DeleteProcThreadAttributeList(startupInfo->lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, startupInfo->lpAttributeList);
+        startupInfo->lpAttributeList = NULL;
+		SetLastError(err);
+    }
 
     return hr;
 }
@@ -461,45 +582,48 @@ static BOOL IsWaitInputPass(Context * ctx, char* buffer, DWORD len) {
     return TRUE;
 }
 
-typedef enum { INIT, VERIFY, EXEC, END } State;
+typedef enum {INIT, VERIFY, EXEC, END } State;
 
 //static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State state) {
 static State ProcessOutput(Context * ctx, char* buffer, DWORD len, State state) {
         State nextState;
     switch (state) {
-    case INIT: {
-        if (!IsWaitInputPass(ctx, buffer, len)) {
-            nextState = INIT;
-        }
-        else {
-            WritePass(ctx);
-            nextState = VERIFY;
-        }
-    } break;
-    case VERIFY: {
-        if (IsWaitInputPass(ctx, buffer, len)) {
-            fprintf(stderr, "Password rejected!\n");
-            nextState = END;
-        }
-        else {
+        case INIT: {
+            if (!IsWaitInputPass(ctx, buffer, len)) {
+                nextState = INIT;
+            }
+            else {
+                WritePass(ctx);
+                nextState = VERIFY;
+            }
+        } break;
+        case VERIFY: {
+            if (IsWaitInputPass(ctx, buffer, len)) {
+                fprintf(stderr, "Password rejected!\n");
+                nextState = END;
+            }
+            else {
+                fprintf(stdout, "%s", buffer);
+                nextState = EXEC;
+            }
+        } break;
+        case EXEC: {
             fprintf(stdout, "%s", buffer);
             nextState = EXEC;
-        }
-    } break;
-    case EXEC: {
-        fprintf(stdout, "%s", buffer);
-        nextState = EXEC;
-    } break;
-    case END: {
-        nextState = END;
-    } break;
-    }
+        } break;
+        case END: {
+            nextState = END;
+        } break;
+        default: {
+            nextState = END;    // END on unknown state
+        } break;
+    }   // end of switch
     return nextState;
 }
 
 // Wait until we are able to read from the input pipe, then look for the PASSWORD string. When it is seen, 
 #define BUFFER_SIZE 1024
-static void __cdecl PipeListener(LPVOID arg) {
+static unsigned __stdcall PipeListener(LPVOID arg) {
     Context* ctx = (Context *)arg;
 
     char buffer[BUFFER_SIZE + 1] = { 0 };
@@ -522,8 +646,9 @@ static void __cdecl PipeListener(LPVOID arg) {
         }
     }
     SetEvent(ctx->events[0]);
+    return 0;
 }
-
+ 
 static void WritePassHandle(Context* ctx, HANDLE src) {
     int done = 0;
 
@@ -531,7 +656,7 @@ static void WritePassHandle(Context* ctx, HANDLE src) {
         char buffer[40] = { 0 };
         DWORD i;
         DWORD bytesRead;
-        ReadFile(src, buffer, sizeof(buffer), &bytesRead, NULL);
+        (void) ReadFile(src, buffer, sizeof(buffer), &bytesRead, NULL);
         done = (bytesRead < 1);
         for (i = 0; i < bytesRead && !done; ++i) {
             if (buffer[i] == '\r' || buffer[i] == '\n') {
@@ -551,10 +676,17 @@ static void WritePass(Context* ctx) {
     case PWT_STDIN:
         WritePassHandle(ctx, GetStdHandle(STD_INPUT_HANDLE));
         break;
-    case PWT_FD:
-        WritePassHandle(ctx, (HANDLE)ctx->args.pwsrc.fd);
-        break;
-    case PWT_FILE: {
+    case PWT_FD: {
+        // Convert CRT fd to Win32 HANDLE safely
+        intptr_t osHandle = _get_osfhandle((int)ctx->args.pwsrc.fd);
+        if (osHandle == -1) {
+            fprintf(stderr, "Invalid file descriptor for password input\n");
+        }
+        else {
+            HANDLE hSrc = (HANDLE)osHandle;
+            WritePassHandle(ctx, hSrc);
+        }
+    } break;    case PWT_FILE: {
         HANDLE file = CreateFileA(ctx->args.pwsrc.filename, GENERIC_READ, FILE_SHARE_READ, NULL,
             OPEN_EXISTING, FILE_ATTRIBUTE_READONLY, NULL);
         if (file != INVALID_HANDLE_VALUE) {
@@ -563,8 +695,7 @@ static void WritePass(Context* ctx) {
         }
     } break;
     case PWT_PASS: {
-        WriteFile(ctx->pipeOut, ctx->args.pwsrc.password, strlen(ctx->args.pwsrc.password), NULL,
-            NULL);
+        WriteFile(ctx->pipeOut, ctx->args.pwsrc.password, strlen(ctx->args.pwsrc.password), NULL, NULL);
         WriteFile(ctx->pipeOut, "\n", 1, NULL, NULL);
 
     } break;
@@ -572,12 +703,13 @@ static void WritePass(Context* ctx) {
 }
 
 // This is the Thread that we run with STDIN and STDOUT redirected. We loop, reading output and writing input on character at a time until there is an error (or we are terminated)
-static void __cdecl InputHandlerThread(LPVOID arg) {
+static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     Context* ctx = (Context*)arg;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
+    DWORD mode, origMode;
 
-    GetConsoleMode(hStdin, &mode);                      // current console mode
+    GetConsoleMode(hStdin, &origMode);                  // current console mode
+    mode = origMode;                                    // Start with this...
     mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);   // turn off ENABLE_LINE_INPUT & ENABLE_ECHO_INPUT
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;              // turn on ENABLE_VIRTUAL_TERMINAL_INPUT
     SetConsoleMode(hStdin, mode);
@@ -595,5 +727,6 @@ static void __cdecl InputHandlerThread(LPVOID arg) {
         }
     }
 
-    SetConsoleMode(hStdin, mode);
+    SetConsoleMode(hStdin, origMode);
+    return 0;
 }

@@ -50,7 +50,7 @@ static int
 argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
                   int flags)
 {
-    const char *s = NULL;
+	char* s = "";       // stop VS2022 from whining about s[0] below, and still works with strtol/strtof
     if (!opt->value)
         goto skipped;
     switch (opt->type) {
@@ -85,11 +85,11 @@ argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
     case ARGPARSE_OPT_INTEGER:
         errno = 0;
         if (self->optvalue) {
-            *(int *)opt->value = strtol(self->optvalue, (char **)&s, 0);
+            *(int *)opt->value = strtol(self->optvalue, &s, 0);
             self->optvalue     = NULL;
         } else if (self->argc > 1) {
             self->argc--;
-            *(int *)opt->value = strtol(*++self->argv, (char **)&s, 0);
+            *(int *)opt->value = strtol(*++self->argv, &s, 0);
         } else {
             argparse_error(self, opt, "requires a value", flags);
         }
@@ -101,11 +101,11 @@ argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
     case ARGPARSE_OPT_FLOAT:
         errno = 0;
         if (self->optvalue) {
-            *(float *)opt->value = strtof(self->optvalue, (char **)&s);
+            *(float *)opt->value = strtof(self->optvalue, &s);
             self->optvalue       = NULL;
         } else if (self->argc > 1) {
             self->argc--;
-            *(float *)opt->value = strtof(*++self->argv, (char **)&s);
+            *(float *)opt->value = strtof(*++self->argv, &s);
         } else {
             argparse_error(self, opt, "requires a value", flags);
         }
@@ -196,6 +196,7 @@ argparse_long_opt(struct argparse *self, const struct argparse_option *options)
     return -2;
 }
 
+// Initialize the argparse structure
 int
 argparse_init(struct argparse *self, struct argparse_option *options,
               const char *const *usages, int flags)
