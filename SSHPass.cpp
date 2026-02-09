@@ -94,7 +94,10 @@
  * v2.1.0.0  2/9/26
  * Added -c / --CtrlC switch to allow users to specify whether Ctrl-C should be handled locally by SSHPass (and not sent to the server process) or whether Ctrl-C
  * should be sent to the server process. This is important because if the user wants to handle Ctrl-C locally, we capture the Ctrl-C and shutdown gracefully.
- * If Ctrl-C is sent to the server process, we rely on the server-side to handle it and keep going or exit so we can shutdown gracefully.
+ * If Ctrl-C is sent to the server process, we rely on the server-side to handle it and keep going or exit so we can shutdown gracefully. Also tweaked exit
+ * code and created CloseInputHandler() to do our best to let the InputHandler thread exit gracefully and restore the console state before exit. Not guaranteeed,
+ * but much better than previous version.
+ * 
  * Commented/if'd out the code for argparse_describe(). It was not being used; code is still there if one wants to use it going forward...
  * 
 ***********************************************************************/
