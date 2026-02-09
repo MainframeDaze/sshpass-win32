@@ -89,8 +89,13 @@
  * 
  * 
  * v2.0.4.0  2/5/2026
- * Added an error message in main() to indicate the PipeListener event could not be creaed (vs. silent exit). Also print error message of
- * VT100 mode cannot be set.
+ * Added an error message in main() to indicate the PipeListener event could not be created (vs. silent exit).
+ * 
+ * v2.1.0.0  2/9/26
+ * Added -c / --CtrlC switch to allow users to specify whether Ctrl-C should be handled locally by SSHPass (and not sent to the server process) or whether Ctrl-C
+ * should be sent to the server process. This is important because if the user wants to handle Ctrl-C locally, we capture the Ctrl-C and shutdown gracefully.
+ * If Ctrl-C is sent to the server process, we rely on the server-side to handle it and keep going or exit so we can shutdown gracefully.
+ * Commented/if'd out the code for argparse_describe(). It was not being used; code is still there if one wants to use it going forward...
  * 
 ***********************************************************************/
 #include <Windows.h>
@@ -123,19 +128,22 @@ typedef struct {
 
     const char* passPrompt;
     int verbose;
+    int ctrlCType;
 
     char* cmd;
 } Args;
 
+// Our Context Structure use to pass info around amongst threads and such
 typedef struct {
-    Args args;
+	Args args;          // Arguments parsed from the command line
 
-    HANDLE pipeIn;
-    HANDLE pipeOut;
+	HANDLE pipeIn;      // Handle for the input side of the pipe we create to talk to the PseudoConsole
+	HANDLE pipeOut;     // Handle for the output side of the pipe we create to talk to the PseudoConsole. We keep this around so we can close it to cause the InputHandler thread to exit when we want to shutdown.
 
-    HANDLE stdOut;
+	HANDLE stdOut;      // Handle for the real STDOUT of the process, used to modify console modes and such
 
-    HANDLE events[2];
+	HANDLE events[3];   // Event handles used for signalling: [0] = PipeListener quitting Event, [1] = Process we launched has exited - this is the process handle, [2] = Ctrl-C pressed Event
+	DWORD  cEvents;     // Count of "active" events in the array above   
 } Context;
 
 static void ParseArgs(int argc, const char* argv[], Context* ctx);
@@ -146,47 +154,149 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
 static unsigned __stdcall PipeListener(LPVOID);
 static unsigned __stdcall InputHandlerThread(LPVOID);
 
+// global pointer to the Context for the console control handler. We need this because the handler only gets the control type otherwiseand has no way to get a pointer to our Context
+static Context* g_ctrlCtx = NULL;
+
+// index into ctx->events[] for the Ctrl-C event (if installed). We need this because the handler needs to know which event to signal when Ctrl-C is pressed. MUST BE THE LAST EVENT IN THE ARRAY
+static const int CTRL_C_EVENT_INDEX = 2;
+
+// Ctrl-C Handler code; only installed IF REQUIRED. Signals the main thread using ctx.events[2]. Return TRUE if we handle Ctrl-C (so System does not take over), FALSE if not.
+static BOOL WINAPI CtrlConsoleHandler(DWORD ctrlType)
+{
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+        // Signal the shutdown event stored in ctx.events[CTRL_C_EVENT_INDEX] (must be created by main)
+        if (g_ctrlCtx != NULL && g_ctrlCtx->events[CTRL_C_EVENT_INDEX] != NULL) {
+            SetEvent(g_ctrlCtx->events[CTRL_C_EVENT_INDEX]);
+            return TRUE; // we handled it
+        }
+    }
+    return FALSE; // not handled
+}
+
+// Install the console control handler and create ctx.events[2].
+// Returns TRUE on success. Caller should check return and proceed even if it fails.
+static BOOL InstallCtrlCHandler(Context* ctx)
+{
+    if (ctx == NULL)
+        return FALSE;
+
+    // Create shutdown event if not already present
+    if (ctx->events[CTRL_C_EVENT_INDEX] == NULL) {
+        ctx->events[CTRL_C_EVENT_INDEX] = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset, initially not signaled
+        if (ctx->events[CTRL_C_EVENT_INDEX] == NULL) {
+            return FALSE;
+        }
+    }
+
+    // Make handler see our ctx. MUST DO THIS before we set the handler!
+    g_ctrlCtx = ctx;
+    // Update active event count to include the shutdown event (events[0] and events[1] already present)
+    ctx->cEvents = CTRL_C_EVENT_INDEX + 1;
+
+    // Register handler
+    if (!SetConsoleCtrlHandler(CtrlConsoleHandler, TRUE)) {
+        CloseHandle(ctx->events[CTRL_C_EVENT_INDEX]);
+        ctx->events[CTRL_C_EVENT_INDEX] = NULL;
+		ctx->cEvents = CTRL_C_EVENT_INDEX;  // update event count to reflect that shutdown event is not active
+		g_ctrlCtx = NULL;                   // don't need this either
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Uninstall the console control handler and destroy ctx.events[2].
+// Safe to call even if Install failed/was not called.
+static void UninstallCtrlCHandler(Context* ctx)
+{
+    if (ctx == NULL)
+        return;
+
+    // Remove handler (ignore return)
+    SetConsoleCtrlHandler(CtrlConsoleHandler, FALSE);
+
+    // Clear global pointer so handler won't touch ctx after uninstall
+    g_ctrlCtx = NULL;
+
+    // Close and clear shutdown event if present
+    if (ctx->events[CTRL_C_EVENT_INDEX] != NULL) {
+        CloseHandle(ctx->events[CTRL_C_EVENT_INDEX]);
+        ctx->events[CTRL_C_EVENT_INDEX] = NULL;
+    }
+
+    // Restore event count (events[0] + events[1])
+    ctx->cEvents = CTRL_C_EVENT_INDEX;
+}
+
+// Helper function to close the input handler thread and its associated event handle. Should be called from the main thread after the PipeListener has quit OR the process we launched has exited.
+// Need to ensure the Input Handler closes so the console can be properly restored by it. WE DO NOT close hInputHandler (but we may close and so mark ctx->pipeOut as part of forcing InputHandler to exit).
+//
+// ctx: pointer to the Context structure with all sorts of goodies
+// hInputHandler: the HANDLE for the Input Handler thread that we want to close
+// returns: ERRRO_SUCCESS else error code. STRONGLY SUGGEST that this error simply be reported and that the caller does their best to continue with shutdown...
+//
+static DWORD CloseInputHandler(Context* ctx, HANDLE hInputHandler)
+{
+    DWORD rc = ERROR_SUCCESS;
+    if (hInputHandler != NULL) {
+        // Close ctx->pipeOut so that InputHandler's Write calls will fail and cause it to exit... once we unblock the ReadFile by cancelling Sync IO for the thread
+        if (ctx->pipeOut != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(ctx->pipeOut);
+            ctx->pipeOut = INVALID_HANDLE_VALUE;
+        }
+        // Now cancel the synch IO for the thread
+        if (!CancelSynchronousIo(hInputHandler))
+        {
+            // Well that did not work
+            rc = GetLastError();
+            fprintf(stderr, "Warning: could not cause InputHandler thread to exit gracefully: %u\n", rc);
+        }
+        else
+        {
+            // Ok now that we have nuked the ReadFile and we know WriteFile will fail, we wait for the thread to exit
+            DWORD wait = WaitForSingleObject(hInputHandler, 2000); // 2s grace
+            if (wait != WAIT_OBJECT_0) {
+                // last resort: wait a bit longer or close handle anyway
+                wait = WaitForSingleObject(hInputHandler, 2000);
+            }
+            if (wait != WAIT_OBJECT_0)
+                // well that did not work either. We are really in a bad state at this point because the thread is still running but we have closed the handle to it, so we cannot wait on it anymore or close it cleanly. 
+                fprintf(stderr, "Warning: InputHandler thread did not exit cleanly, your console behavior could be wonky...\n");
+        }
+    }
+	return rc;
+}
+
 // Entry point for the program. Parses command line arguments, sets up the pseudo console and pipes, starts the listener and input handler threads, and waits for the child process to exit before cleaning up and 
 // returning the child's exit code (or an error code if something went wrong). May also return EXIT_FAILURE vs a specific Win32 error code.
 int main(int argc, const char* argv[]) {
-    Context ctx;
+    Context ctx = { 0 };                            // keep compiler happy
     uint32_t childExitCode = ERROR_SUCCESS;
     int rc = ERROR_SUCCESS;
-
-    ParseArgs(argc, argv, &ctx);
-
-    HRESULT hr = E_UNEXPECTED;
 
     ctx.pipeIn = INVALID_HANDLE_VALUE;              // these will be created shortly
     ctx.pipeOut = INVALID_HANDLE_VALUE;
     ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);   // used to modify the status of the launching console.
 
+    ParseArgs(argc, argv, &ctx);
+
+    HRESULT hr = E_UNEXPECTED;
+
     // This event will be used by the PipeListener thread to signal us that it is quitting...
-    ctx.events[0] = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (ctx.events[0] == NULL) {
+    ctx.events[ctx.cEvents] = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (ctx.events[ctx.cEvents] == NULL) {
 		fprintf(stderr, "Could not create input thread event: %u\n", GetLastError());
         return EXIT_FAILURE;
     }
-
-    // Allow VT100 ANSI Terminal Escape sequences to be procesed by this console
-    DWORD consoleMode = 0;
-    if (GetConsoleMode(ctx.stdOut, &consoleMode))
-        (void)SetConsoleMode(ctx.stdOut, consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    // Get whatever error code came from either of the above calls
-    rc = GetLastError();
-    if (rc != ERROR_SUCCESS)
-    {
-        // Oops... fail if we cannot set the Console Mode as desired
-        fprintf(stderr, "Could not set console mode to enable VT processing: %u\n", rc);
-        return rc;
-    }
+    ctx.cEvents++;      // track this event
 
     HPCON hpcon = INVALID_HANDLE_VALUE;     // this is the PseudoConsole handle
 
 	// Create an input and output handle for the PseudoConsole (in <ctx>), and create the PseudoConsole itself; handle returned in hpcon.
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);     // if this fails, GetLastError() has the error code
     if (S_OK == hr) {
-        /* start PipeListener using _beginthreadex so we get a real HANDLE we can close */
+		// Start PipeListener using _beginthreadex so we get a real HANDLE we can close. This thread will set ctx.events[0] when it is quitting
+        // so we can respond to that and do a clean shutdown.
         uintptr_t ulPipeListener = _beginthreadex(NULL, 0, PipeListener, &ctx, 0, NULL);
         HANDLE hPipeListener = NULL;
         HANDLE hInputHandler = NULL;
@@ -226,9 +336,11 @@ int main(int argc, const char* argv[]) {
             if (S_OK == hr) {
                 DWORD d = WAIT_TIMEOUT;
 
-                ctx.events[1] = cmdProc.hThread;
+				ctx.events[ctx.cEvents] = cmdProc.hThread;      // the process thread handle; used for WaitForMultipleObjects
+                ctx.cEvents++;
 
-                /* start input handler using _beginthreadex so we get a HANDLE we can close */
+                // Start input handler using _beginthreadex so we get a HANDLE we can close. This call, if successful, also starts mucking with Console settings (we
+				// want to ensure this thread exits cleanly so that it can restore the console settings on its way out -- see CloseInputHandler().
                 uintptr_t ulInputHandler = _beginthreadex(NULL, 0, InputHandlerThread, &ctx, 0, NULL);
                 if (ulInputHandler == 0) {
                     rc = GetLastError();
@@ -243,15 +355,24 @@ int main(int argc, const char* argv[]) {
                 /* We don't wait on hInputHandler in the WFMO (we wait on the child process thread),
                    but we must close the handle later after the thread terminates. */
 
+                // Do we need the Ctrl-C handler? If so, enable it. DO NOT fail if this fails
+                if (ctx.args.ctrlCType == CTRLC_LOCAL) {
+                    if (!InstallCtrlCHandler(&ctx)) {
+                        fprintf(stderr, "Warning: could not install Ctrl-C handler: %u\n", GetLastError());
+                        // continue — graceful shutdown still attempted via other paths
+                    }
+                }
+
                 // Wait until we get a signal ([process exit or input comes in
                 // event[0] = signalled from thread
                 // event[1] = process ended
+				// event[2] = Ctrl-C pressed (if we installed the handler)
                 //
                 while (d == WAIT_TIMEOUT)
                 {
 					// Event 0 comes from PipeListener thread - signals it is ending. Event 1 comes from the child process thread (e.g. SSH or SCP) - signals it is ending. 
                     // Either way we are quitting...
-                    d = WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE, INFINITE); // wait 1 minute
+                    d = WaitForMultipleObjects(ctx.cEvents, ctx.events, FALSE, INFINITE); // wait 1 minute
                     if (d == WAIT_TIMEOUT)  // This never happens now because wait is INFINITE
                         d = WAIT_TIMEOUT;   // use to trap on debug
                     //fprintf(stderr, "WFMO result %i\n", d);
@@ -268,11 +389,18 @@ int main(int argc, const char* argv[]) {
 					fprintf(stderr, "Child process for cmd '%s' exited with code %u\n", ctx.args.cmd, childExitCode);
                 }
             }
+            // Try to ensure a clean exit by InputHandler which restores our console state... DO NOT fail at this point if we cannot make this happen (reported by CloseInputHandler()) because we want the
+            // rest of our shutdown code to run.
+			rc = CloseInputHandler(&ctx, hInputHandler);
 
             /* Close process handles as before */
             CloseHandle(cmdProc.hThread);
             CloseHandle(cmdProc.hProcess);
 
+			// Uninstall Ctrl-C handler if we installed it
+            if (ctx.args.ctrlCType == CTRLC_LOCAL) {
+                UninstallCtrlCHandler(&ctx);
+            }
             /* Close the input handler thread handle now that the process ended and we've waited */
             if (hInputHandler) {
                 CloseHandle(hInputHandler);
@@ -281,9 +409,12 @@ int main(int argc, const char* argv[]) {
             if (hPipeListener) {
                 CloseHandle(hPipeListener);
             }
-
-            DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
-            HeapFree(GetProcessHeap(), 0, startupInfo.lpAttributeList);
+            if (startupInfo.lpAttributeList != NULL)
+            {
+				// Delete and Free the Attribute List we created
+                DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
+                HeapFree(GetProcessHeap(), 0, startupInfo.lpAttributeList);
+            }
         }
         else
         {
@@ -326,6 +457,7 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
 
     const char* passPrompt = NULL;
     int verbose = 0;
+    const char* ctrlc = NULL;
 
     struct argparse_option options[] = {
             OPT_HELP(),
@@ -335,8 +467,9 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
             OPT_STRING('p', NULL, &strpass, "Provide password as argument (security unwise)", NULL, 0, 0),
             OPT_BOOLEAN('e', NULL, &envPass, "Password is passed as env-var \"SSHPASS\"", NULL, 0, 0),
             OPT_GROUP("Other options: "),
-            OPT_STRING('P', NULL, &passPrompt, "Which string should sshpass search for to detect a\npassword prompt (case insensitive)", NULL, 0, 0),
+            OPT_STRING('P', NULL, &passPrompt, "Which string should sshpass search for to detect a password prompt (case insensitive; default is \"password:\")", NULL, 0, 0),
             OPT_BOOLEAN('v', NULL, &verbose, "Be verbose about what you're doing", NULL, 0, 0),
+            OPT_STRING('c', "ctrlc", &ctrlc, "Where to handle Ctrl-C; either \"local\" (Ctrl-C handled by this process) or \"server\" (Default; Ctrl-C sent to server process)", NULL, 0, 0),
             OPT_END(),
     };
 
@@ -379,6 +512,22 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
     else {
         ctx->args.passPrompt = "password:";
     }
+
+    if (ctrlc != NULL) {
+        if (_stricmp(ctrlc, "local") == 0) {
+            ctx->args.ctrlCType = CTRLC_LOCAL; // local
+        }
+        else if (_stricmp(ctrlc, "server") == 0) {
+            ctx->args.ctrlCType = CTRLC_SERVER; // server
+        }
+        else {
+            fprintf(stderr, "Invalid value for -c option: %s\n", ctrlc);
+            exit(EXIT_FAILURE);
+        }
+    }
+    else {
+        ctx->args.ctrlCType = CTRLC_SERVER; // default is Server
+	}
 
     __int64 cmdLen = 0;
     for (int i = 0; i < argc; i++) {
@@ -535,14 +684,15 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXA* star
 }
 
 #define _TCHAR char
-_TCHAR* stristr(_TCHAR* pszMain, _TCHAR* pszFind, int iMaxLen)
+_TCHAR* stristr(_TCHAR* pszMain, _TCHAR* pszFind, DWORD dMaxLen)
 {
     _TCHAR* p;
     DWORD	i, j, n, iNext;
     DWORD	dwFind, dwMain;
 
-    dwFind = strlen(pszFind);
-    dwMain = min(strlen(pszMain), iMaxLen);
+	// Use static_cast to avoid compiler warnings about truncation - not worried about strings > 4GB in length
+    dwFind = static_cast<DWORD>(strlen(pszFind) );
+    dwMain = min(static_cast<DWORD>(strlen(pszMain) ), dMaxLen);
 
     if (dwFind > dwMain)
     {
@@ -744,7 +894,7 @@ static void WritePass(Context* ctx) {
         }
     } break;
     case PWT_PASS: {
-        WriteFile(ctx->pipeOut, ctx->args.pwsrc.password, strlen(ctx->args.pwsrc.password), NULL, NULL);
+        WriteFile(ctx->pipeOut, ctx->args.pwsrc.password, static_cast<DWORD>(strlen(ctx->args.pwsrc.password) ), NULL, NULL);
         WriteFile(ctx->pipeOut, "\n", 1, NULL, NULL);
 
     } break;
@@ -763,6 +913,12 @@ static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     GetConsoleMode(hStdin, &origMode);                  // current console mode
     mode = origMode;                                    // Start with this...
     mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);   // turn off ENABLE_LINE_INPUT & ENABLE_ECHO_INPUT
+    if (ctx->args.ctrlCType == CTRLC_LOCAL)
+        mode |= ENABLE_PROCESSED_INPUT;                 // turn on ENABLE_PROCESSED_INPUT
+    else
+        mode &= ~ENABLE_PROCESSED_INPUT;                // turn off ENABLE_PROCESSED_INPUT
+	
+    // Allow VT100 ANSI Terminal Escape sequences to be procesed by this console
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;              // turn on ENABLE_VIRTUAL_TERMINAL_INPUT
     SetConsoleMode(hStdin, mode);
 
@@ -770,12 +926,11 @@ static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     DWORD bytesRead, bytesWritten;
 
 	// Get each keystroke from the main console window and write it to the PS for processing. This allows the user to interact with the PS process (e.g. SSH or SCP) as if they were directly at a console for that process. 
-    // We keep doing this until we get an error or 0 bytes read which indicates the console input is closing (e.g. user pressed Ctrl+Z or closed the window).
+    // We keep doing this until we get an error or 0 bytes read which indicates the console input is closing (e.g. user pressed Ctrl+Z or closed the window). We do NOT report read or write errors here.
     while (1) {
         if (!ReadFile(hStdin, &buffer, 1, &bytesRead, NULL) || bytesRead == 0) {
             break;
         }
-
         if (!WriteFile(ctx->pipeOut, &buffer, 1, &bytesWritten, NULL)) {
             break;
         }

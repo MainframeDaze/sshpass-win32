@@ -21,11 +21,17 @@ struct argparse_option;
 typedef int argparse_callback (struct argparse *self,
                                const struct argparse_option *option);
 
-// Constants used in arg parsing
+// Constants used in arg parsing ----------------------------
+
+// For password types
 #define PWT_STDIN       1           // Password comes fron STDIN
 #define PWT_FILE        2           // Password in file (name on command line)
 #define PWT_FD          3           // Password given as numeric File Descriptor
 #define PWT_PASS        4           // Password given on cmd line as string
+
+// For Ctrl-C types
+#define CTRLC_LOCAL    1           // Ctrl-C handled by this process
+#define CTRLC_SERVER   2           // Ctrl-C sent to server process
 
 enum argparse_flag {
     ARGPARSE_STOP_AT_NON_OPTION  = 1 << 0,
@@ -125,10 +131,8 @@ int argparse_help_cb_no_exit(struct argparse *self,
                                      "show this help message and exit", \
                                      argparse_help_cb, 0, OPT_NONEG)
 
-int argparse_init(struct argparse *self, struct argparse_option *options,
-                  const char *const *usages, int flags);
-void argparse_describe(struct argparse *self, const char *description,
-                       const char *epilog);
+int argparse_init(struct argparse *self, struct argparse_option *options, const char *const *usages, int flags);
+// void argparse_describe(struct argparse *self, const char *description, const char *epilog);
 int argparse_parse(struct argparse *self, int argc, const char **argv);
 void argparse_usage(struct argparse *self);
 

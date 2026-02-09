@@ -210,13 +210,13 @@ argparse_init(struct argparse *self, struct argparse_option *options,
     return 0;
 }
 
-void
-argparse_describe(struct argparse *self, const char *description,
-                  const char *epilog)
+#if 0   // never used
+void argparse_describe(struct argparse *self, const char *description, const char *epilog)
 {
     self->description = description;
     self->epilog      = epilog;
 }
+#endif
 
 int
 argparse_parse(struct argparse *self, int argc, const char **argv)
