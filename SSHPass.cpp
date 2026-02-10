@@ -100,6 +100,9 @@
  * 
  * Commented/if'd out the code for argparse_describe(). It was not being used; code is still there if one wants to use it going forward...
  * 
+ * v2.1.1.0  2/10/26
+ * Modified CloseInputHandler() to return ERROR_NOT_READY if it does not see the InputHandler thread exit within the set delay time (4 seconds). Warn user that their
+ * Console Mode might be messed up.
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -235,7 +238,8 @@ static void UninstallCtrlCHandler(Context* ctx)
 //
 // ctx: pointer to the Context structure with all sorts of goodies
 // hInputHandler: the HANDLE for the Input Handler thread that we want to close
-// returns: ERRRO_SUCCESS else error code. STRONGLY SUGGEST that this error simply be reported and that the caller does their best to continue with shutdown...
+// returns: ERRRO_SUCCESS else error code. STRONGLY SUGGEST that this error simply be reported and that the caller does their best to continue with shutdown... note that we use
+// ERROR_NOT_READY if we do not see the InputHandler thread exit.
 //
 static DWORD CloseInputHandler(Context* ctx, HANDLE hInputHandler)
 {
@@ -263,8 +267,11 @@ static DWORD CloseInputHandler(Context* ctx, HANDLE hInputHandler)
                 wait = WaitForSingleObject(hInputHandler, 2000);
             }
             if (wait != WAIT_OBJECT_0)
+            {
                 // well that did not work either. We are really in a bad state at this point because the thread is still running but we have closed the handle to it, so we cannot wait on it anymore or close it cleanly. 
                 fprintf(stderr, "Warning: InputHandler thread did not exit cleanly, your console behavior could be wonky...\n");
+				rc = ERROR_NOT_READY; // just some code to indicate failure to see the thread exit. Not worth caller terminating over, but should be logged.
+            }
         }
     }
 	return rc;
@@ -395,6 +402,9 @@ int main(int argc, const char* argv[]) {
             // Try to ensure a clean exit by InputHandler which restores our console state... DO NOT fail at this point if we cannot make this happen (reported by CloseInputHandler()) because we want the
             // rest of our shutdown code to run.
 			rc = CloseInputHandler(&ctx, hInputHandler);
+            if (rc != ERROR_SUCCESS)
+                // Just warn them
+				fprintf(stderr, "Warning: We may not have been able to restore the Console State to its original settings.\nIf your console is acting wierd, please close and re-open it...\n");
 
             /* Close process handles as before */
             CloseHandle(cmdProc.hThread);
