@@ -102,7 +102,8 @@
  * 
  * v2.1.1.0  2/10/26
  * Modified CloseInputHandler() to return ERROR_NOT_READY if it does not see the InputHandler thread exit within the set delay time (4 seconds). Warn user that their
- * Console Mode might be messed up.
+ * Console Mode might be messed up. If you press Ctrl-C with -clocal set, we do our best to restore the console state. 
+ * 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -269,7 +270,7 @@ static DWORD CloseInputHandler(Context* ctx, HANDLE hInputHandler)
             if (wait != WAIT_OBJECT_0)
             {
                 // well that did not work either. We are really in a bad state at this point because the thread is still running but we have closed the handle to it, so we cannot wait on it anymore or close it cleanly. 
-                fprintf(stderr, "Warning: InputHandler thread did not exit cleanly, your console behavior could be wonky...\n");
+                fprintf(stderr, "Warning: InputHandler thread did not exit cleanly.\n");
 				rc = ERROR_NOT_READY; // just some code to indicate failure to see the thread exit. Not worth caller terminating over, but should be logged.
             }
         }
@@ -314,11 +315,10 @@ int main(int argc, const char* argv[]) {
         if (ulPipeListener == 0) {
             rc = GetLastError();
             fprintf(stderr, "Warning: could not start PipeListener thread (continuing): %u\n", rc);
-            /* we continue — PipeListener not running; behavior may be degraded */
+            /* we continue — PipeListener not running; behavior may be degraded - but will it really work?? */
         }
-        else {
+        else
             hPipeListener = (HANDLE)ulPipeListener;
-        }
 
 #pragma pack(push, 1)  // ensure byte alignment for the structure below
         STARTUPINFOEXA startupInfo = { 0 };
@@ -336,7 +336,7 @@ int main(int argc, const char* argv[]) {
             if (rc == 0)
             {
                 rc = GetLastError();
-				fprintf(stderr, "CreateProcessA failed on '%s': %u\n", ctx.args.cmd, rc);
+				fprintf(stderr, "CreateProcess failed on '%s': %u\n", ctx.args.cmd, rc);
 				childExitCode = rc; // so this is available on exit (tho hr will force EXIT_FAILURE return)
                 hr = E_UNEXPECTED;
             }
