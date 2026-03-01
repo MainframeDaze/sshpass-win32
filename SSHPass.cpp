@@ -104,6 +104,14 @@
  * Modified CloseInputHandler() to return ERROR_NOT_READY if it does not see the InputHandler thread exit within the set delay time (4 seconds). Warn user that their
  * Console Mode might be messed up. If you press Ctrl-C with -clocal set, we do our best to restore the console state. 
  * 
+ * v2.1.1.1  2/12/26
+ * Added code signing to Post-Build step for release only:
+ * "c:\program files (x86)\Windows Kits\10\bin\10.0.22621.0\x86\signtool.exe" sign /a /td sha256 /fd sha256 /tr http://timestamp.digicert.com?td=sha256 $(TargetPath)
+ * 
+ * v2.2.0.0 2/28/26
+ * Added -C --CredMgr option. Must be followed by the name of a Generic Credential saved in Credential Manager. The User ID field is ignored (you still need to enter that
+ * at the correct spot in your command line); we just extract the password to feed in. If a matching credential is NOT found, we fall back to STDIN (you have to type the pw youself).
+ * 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -117,6 +125,7 @@
 #include <io.h> // for _get_osfhandle()
 
 #include "argparse.h"
+#include "Credentials.h"
 
 static const char* const usages[] = {
         "sshpass [options] command arguments",
@@ -131,6 +140,7 @@ typedef struct {
         const char* filename;
         int64_t fd;
         const char* password;
+        const char* credManagerPWTag;
     } pwsrc;
 
     const char* passPrompt;
@@ -381,6 +391,7 @@ int main(int argc, const char* argv[]) {
                 while (d == WAIT_TIMEOUT)
                 {
 					// Event 0 comes from PipeListener thread - signals it is ending. Event 1 comes from the child process thread (e.g. SSH or SCP) - signals it is ending. 
+                    // Event 2, if present: Ctrl-C pressed and we need to handle it
                     // Either way we are quitting...
                     d = WaitForMultipleObjects(ctx.cEvents, ctx.events, FALSE, INFINITE); // wait 1 minute
                     if (d == WAIT_TIMEOUT)  // This never happens now because wait is INFINITE
@@ -471,6 +482,7 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
     const char* passPrompt = NULL;
     int verbose = 0;
     const char* ctrlc = NULL;
+    const char* credManagerPWTag = NULL;
 
     struct argparse_option options[] = {
             OPT_HELP(),
@@ -479,6 +491,7 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
             OPT_INTEGER('d', NULL, &number, "Use number as file descriptor for getting password", NULL, 0, 0),
             OPT_STRING('p', NULL, &strpass, "Provide password as argument (security unwise)", NULL, 0, 0),
             OPT_BOOLEAN('e', NULL, &envPass, "Password is passed as env-var \"SSHPASS\"", NULL, 0, 0),
+            OPT_STRING('C', "CredMgr", &credManagerPWTag, "Password pulled from Windows Credential Manager Generic Credentials using \"tag\" as the lookup key. If it is not found then fallback to STDIN input.", NULL, 0, 0),
             OPT_GROUP("Other options: "),
             OPT_STRING('P', NULL, &passPrompt, "Which string should sshpass search for to detect a password prompt (case insensitive; default is \"password:\")", NULL, 0, 0),
             OPT_BOOLEAN('v', NULL, &verbose, "Be verbose about what you're doing", NULL, 0, 0),
@@ -493,10 +506,6 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
         argparse_usage(&argparse);
         exit(EXIT_FAILURE);
     }
-// TEST CODE - look at the path
-//#pragma warning(suppress : 4996)    // So "getenv" calls are not pissed on
-//    ctx->args.pwsrc.password = getenv("PATH");
-
     ctx->args.verbose = verbose;
     if (filename != NULL) {
         ctx->args.pwtype = PWT_FILE;
@@ -514,6 +523,10 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
         ctx->args.pwtype = PWT_PASS;
 #pragma warning(suppress : 4996)    // So "getenv" calls are not pissed on
         ctx->args.pwsrc.password = getenv("SSHPASS");
+    }
+    else if (credManagerPWTag != NULL) {
+        ctx->args.pwtype = PWT_CREDMGR;
+        ctx->args.pwsrc.credManagerPWTag = credManagerPWTag;
     }
     else {
         ctx->args.pwtype = PWT_STDIN;
@@ -909,8 +922,31 @@ static void WritePass(Context* ctx) {
     case PWT_PASS: {
         WriteFile(ctx->pipeOut, ctx->args.pwsrc.password, static_cast<DWORD>(strlen(ctx->args.pwsrc.password) ), NULL, NULL);
         WriteFile(ctx->pipeOut, "\n", 1, NULL, NULL);
-
     } break;
+    case PWT_CREDMGR: {
+        SecretBuffer sbpw;
+
+        sbpw = get_vault_pass(ctx->args.pwsrc.credManagerPWTag);
+        if (sbpw.data == NULL || sbpw.len == 0)
+        {
+            // No matching credential found (or no data in a matching cred)
+            fprintf(stderr, "Did not find Generic Credential \"%s\" or no password found under this credential, rc= %i\nReverting to Keyboard Input to enter password...\n", 
+                ctx->args.pwsrc.credManagerPWTag, GetLastError());
+
+            // Run the STDIN code...
+            WritePassHandle(ctx, GetStdHandle(STD_INPUT_HANDLE));
+        }
+        else
+        {
+            // We have a PW in sbpw... use then destroy it
+            WriteFile(ctx->pipeOut, sbpw.data, static_cast<DWORD>(sbpw.len), NULL, NULL);
+            WriteFile(ctx->pipeOut, "\n", 1, NULL, NULL);
+
+            final_burn(sbpw);   // clear it out
+        }
+
+    }
+    // end of SWITCH
     }
 }
 

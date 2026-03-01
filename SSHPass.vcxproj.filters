@@ -21,12 +21,18 @@
     <ClCompile Include="argparse.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Credentials.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="argparse.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Credentials.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

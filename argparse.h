@@ -28,6 +28,7 @@ typedef int argparse_callback (struct argparse *self,
 #define PWT_FILE        2           // Password in file (name on command line)
 #define PWT_FD          3           // Password given as numeric File Descriptor
 #define PWT_PASS        4           // Password given on cmd line as string
+#define PWT_CREDMGR     5           // Password pulled from CredMgr using the name/tag on cmd line
 
 // For Ctrl-C types
 #define CTRLC_LOCAL    1           // Ctrl-C handled by this process
