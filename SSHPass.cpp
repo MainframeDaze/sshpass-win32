@@ -112,6 +112,21 @@
  * Added -C --CredMgr option. Must be followed by the name of a Generic Credential saved in Credential Manager. The User ID field is ignored (you still need to enter that
  * at the correct spot in your command line); we just extract the password to feed in. If a matching credential is NOT found, we fall back to STDIN (you have to type the pw youself).
  * 
+ * v2.2.1.0 3/3/26
+ * Added the -n / --noVT100 option to support consoles that do NOT support VT100. E.g. some older Netgear, D-Link and TP-Line routers, some Ubiquity devices...
+ * Changes to Args struct and ParseArgs(), along with a quick IF before setting ENABLE_VIRTUAL_TERMINAL_INPUT in InputHandlerThread(). Also changed Context structure;
+ * replaced the stdout member, which was never used, with origOutMode (the original mode of Console OUTPUT). Added code to CreatePusedoConsoleAndPipes() 
+ * to configure ENABLE_VIRTUAL_TERMINAL_PROCESSING and DISABLE_NEWLINE_AUTORETURN as appropriate for VT100 support, along with a new method,
+ * RestoreConsoleOutputMode() to restore the original setting on exit if we change it. Did this outside of PipeListener() to avoid race conditions (e.g. if PTY outputs
+ * something before the thread starts and configures the Console Mode. Several changes in main() to support this. Setting ENABLE_VIRTUAL_TERMINAL_PROCESSING and DISABLE_NEWLINE_AUTORETURN
+ * allowed SSH to properly connect to an AUSTOR NAS I've been testing with (before that, Esc sequences were appearing and making my console screen unreadable).
+ * 
+ * While -n was not required I added it as part of this process to handle non-VT100 remote consoles. The changing of the Output Console Mode was needed to support ASUSTOR ADM,
+ * which sent more advanced VT100 squences that other consoles (one I tested is pfSense) do not. So control characters were showing up all over the place.
+ * 
+ * For DEBUG, added PRESS ENTER TWICE at end. Something about the pipes and threads leaves us in a state where _getch() wants 2 Enters before it returns :\. I wanted
+ * an easy way to keep a debug window launched by the debugger opened so I could review the results before it is destroyed.
+ * 
 ***********************************************************************/
 #include <Windows.h>
 #include <process.h>
@@ -123,6 +138,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <io.h> // for _get_osfhandle()
+#include <conio.h>  // for _getch()
 
 #include "argparse.h"
 #include "Credentials.h"
@@ -146,6 +162,7 @@ typedef struct {
     const char* passPrompt;
     int verbose;
     int ctrlCType;
+    int noVT100;
 
     char* cmd;
 } Args;
@@ -157,7 +174,7 @@ typedef struct {
 	HANDLE pipeIn;      // Handle for the input side of the pipe we create to talk to the PseudoConsole
 	HANDLE pipeOut;     // Handle for the output side of the pipe we create to talk to the PseudoConsole. We keep this around so we can close it to cause the InputHandler thread to exit when we want to shutdown.
 
-	HANDLE stdOut;      // Handle for the real STDOUT of the process, used to modify console modes and such
+	DWORD origOutMode;  // Original Console Buffer Output mode flags. Used to restore those settings just before we exit
 
 	HANDLE events[3];   // Event handles used for signalling: [0] = PipeListener quitting Event, [1] = Process we launched has exited - this is the process handle, [2] = Ctrl-C pressed Event
 	DWORD  cEvents;     // Count of "active" events in the array above   
@@ -288,6 +305,35 @@ static DWORD CloseInputHandler(Context* ctx, HANDLE hInputHandler)
 	return rc;
 }
 
+// Call just before exit to restore the console output mode to its original state IFF we set it in CreatePseudoConsoleAndPipes().
+//
+void RestoreConsoleOutputMode(Context* ctx) 
+{
+    bool    bSetOk = false;
+
+    // Only proceed if we actually successfully captured a mode (value is non-zero)
+    if (ctx != NULL && ctx->origOutMode != 0) {
+
+        // Open the physical console screen buffer directly
+        // HANDLE hConsole = CreateFile(L"CONOUT$", GENERIC_READ | GENERIC_WRITE,  FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        // NO stick with the same method used in CreatePseudoConsoleAndPipes() for consistency. If redirection made that fail, then we won't be in here
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+
+        if (hConsole != INVALID_HANDLE_VALUE) {
+            // Revert to the exact state we found it in
+            bSetOk = SetConsoleMode(hConsole, ctx->origOutMode) != 0;
+            // CloseHandle(hConsole);       // DO NOT close std handles. Only use if the CreateFile is called 
+        }
+        // A single warning message if either the GetStdHandle failed OR SetConsoleMode failed (in BOTH cases, bSetOk is FALSE)
+        if (!bSetOk)
+            fprintf(stderr, "WARNING: Unable to open Console Handle to STDOUT to restore the console mode settings; you may need to close your CMD window and reopen it if output is messy.\n");
+
+        // Reset the signal to 0 to prevent accidental double-restoration
+        ctx->origOutMode = 0;
+    }
+}
+
+
 // Entry point for the program. Parses command line arguments, sets up the pseudo console and pipes, starts the listener and input handler threads, and waits for the child process to exit before cleaning up and 
 // returning the child's exit code (or an error code if something went wrong). May also return EXIT_FAILURE vs a specific Win32 error code.
 int main(int argc, const char* argv[]) {
@@ -297,7 +343,7 @@ int main(int argc, const char* argv[]) {
 
     ctx.pipeIn = INVALID_HANDLE_VALUE;              // these will be created shortly
     ctx.pipeOut = INVALID_HANDLE_VALUE;
-    ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);   // used to modify the status of the launching console.
+    //ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);   // used to modify the status of the launching console.
 
     ParseArgs(argc, argv, &ctx);
 
@@ -417,6 +463,9 @@ int main(int argc, const char* argv[]) {
                 // Just warn them
 				fprintf(stderr, "Warning: We may not have been able to restore the Console State to its original settings.\nIf your console is acting wierd, please close and re-open it...\n");
 
+            // Now restore Output mode too
+            RestoreConsoleOutputMode(&ctx);
+
             /* Close process handles as before */
             CloseHandle(cmdProc.hThread);
             CloseHandle(cmdProc.hProcess);
@@ -470,6 +519,13 @@ int main(int argc, const char* argv[]) {
         fprintf(stderr, "CreatePseudoConsoleAndPipes() failed, rc = %i", childExitCode);
 		hr = S_OK;      // so we return the error code from CreatePseudoConsoleAndPipes()
     }
+#ifdef _DEBUG
+    {
+        int i;
+        fprintf(stdout, "Program Exiting with RC = %i, press ENTER TWICE to exit", S_OK == hr ? childExitCode : EXIT_FAILURE);
+        i = _getch();
+    }
+#endif
     return S_OK == hr ? childExitCode : EXIT_FAILURE;
 }
 
@@ -478,11 +534,12 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
     int64_t number = 0;
     const char* strpass = NULL;
     int envPass = 0;
+    const char* credManagerPWTag = NULL;
 
     const char* passPrompt = NULL;
     int verbose = 0;
     const char* ctrlc = NULL;
-    const char* credManagerPWTag = NULL;
+    int noVT100 = 0;
 
     struct argparse_option options[] = {
             OPT_HELP(),
@@ -496,6 +553,7 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
             OPT_STRING('P', NULL, &passPrompt, "Which string should sshpass search for to detect a password prompt (case insensitive; default is \"password:\")", NULL, 0, 0),
             OPT_BOOLEAN('v', NULL, &verbose, "Be verbose about what you're doing", NULL, 0, 0),
             OPT_STRING('c', "ctrlc", &ctrlc, "Where to handle Ctrl-C; either \"local\" (Ctrl-C handled by this process) or \"server\" (Default; Ctrl-C sent to server process)", NULL, 0, 0),
+            OPT_BOOLEAN('n', "noVT100", &noVT100, "Disable use of VT100 virtual terminal sequences (just text)", NULL, 0, 0),
             OPT_END(),
     };
 
@@ -554,6 +612,7 @@ static void ParseArgs(int argc, const char* argv[], Context* ctx) {
     else {
         ctx->args.ctrlCType = CTRLC_SERVER; // default is Server
 	}
+    ctx->args.noVT100 = noVT100;
 
     __int64 cmdLen = 0;
     for (int i = 0; i < argc; i++) {
@@ -596,6 +655,9 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
     HANDLE pipePtyOut = INVALID_HANDLE_VALUE;
 	BOOL   bPipe1Ok, bPipe2Ok = 0;      // bPike20KOk initialized to 0 to avoid compiler warning
     int     rc = ERROR_SUCCESS;
+    
+    // Need this set REGARDLESS of whether or not we get pipes, etc. It signals exit processing to NOT try to restore the original value
+    ctx->origOutMode = 0;       // While legal, not a typical value so we will skip re-setting if this is the value
 
     // Must create 2 sets of pipes (if we used ctx->pipeOut and pipePtyIn, everything we send to pipePtyIn would come right back out via ctx-PipeOut. We will
     // discard the pipePtyIn (and pipePtyOut) handle before exiting; these will be STDIN and STDOUT/STDERR for the PsuedoConsole. ctx will have the other handles.
@@ -610,14 +672,52 @@ static HRESULT CreatePseudoConsoleAndPipes(HPCON* hpcon, Context* ctx) {
         COORD consoleSize = { 0 };
 
         CONSOLE_SCREEN_BUFFER_INFO csbi;
+        // Changes for v2.2.1 - check the console handle before calling GetConsoleScreenBuffer. ALSO: if this works, set VT100 output settings
         HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        if (hConsole != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(hConsole, &csbi)) 
+        {
             consoleSize.X = csbi.srWindow.Right - csbi.srWindow.Left + 1;
             consoleSize.Y = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+            // --- VT100 SETUP START ---
+            if (GetConsoleMode(hConsole, &ctx->origOutMode)) 
+            {
+                DWORD outMode = ctx->origOutMode;
+                if (ctx->args.noVT100) 
+                {
+                    // Turn OFF VT100 sequences and ENABLE Auto Newline Return
+                    outMode &= ~ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                    outMode &= ~DISABLE_NEWLINE_AUTO_RETURN;
+                }
+                else
+                {
+                    // ENABLE VT100 sequences and DISABLE Auto Newline return
+                    outMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                    outMode |= DISABLE_NEWLINE_AUTO_RETURN; // Helps with SSH alignment
+                }
+                if (outMode == ctx->origOutMode)
+                    // Hmm nothing changes so do not set
+                    ctx->origOutMode = 0;   // and do not RESET
+                else if (!SetConsoleMode(hConsole, outMode))
+                {
+                    // Could not set the mode, so clear the flag and warn the user
+                    ctx->origOutMode = 0;
+                    fprintf(stderr, "WARNING: Unable to %sable VT100 mode; output may appear strange.\n", ctx->args.noVT100 ? "dis" : "en");
+                }
+            }
+            else
+            {
+                // Could NOT get the console mode
+                fprintf(stderr, "WARNING: Unable to read current Console Mode; skipping setting Terminal Mode (so output may look odd)\n");
+            }
+            // --- VT100 SETUP END ---
         }
-        else {
+        else
+        {
+            // We could not get the console handle or size, so go with these defaults
             consoleSize.X = 120;
             consoleSize.Y = 25;
+            fprintf(stderr, "WARNING: Unable to read current Console settings; using default X/Y of %i/%i, and skipping setting Terminal Mode (so output may look odd)\n", consoleSize.X,
+                consoleSize.Y);
         }
 		// Now create the pseudoconsole with its pipes; handle we use returned in hpcon (which is a POINTER to a handle). 
         hr = CreatePseudoConsole(consoleSize, pipePtyIn, pipePtyOut, 0, hpcon);
@@ -844,32 +944,31 @@ static State ProcessOutput(Context * ctx, char* buffer, DWORD len, State state) 
 
 // Wait until we are able to read from the input pipe, then process data as it comes in with ProcessOutput(). 
 // Runs in its own thread. Signals through ctx->events[0] when we are done processing (either process ended or we got a password failure and are exiting).
+// Wait until we are able to read from the input pipe, then process data as it comes in with ProcessOutput(). 
+// Runs in its own thread. Signals through ctx->events[0] when we are done processing (either process ended or we got a password failure and are exiting).
 #define BUFFER_SIZE 1024
 static unsigned __stdcall PipeListener(LPVOID arg) {
-    Context* ctx = (Context *)arg;
+    Context* ctx = (Context*)arg;
 
     char buffer[BUFFER_SIZE + 1] = { 0 };
-
     DWORD bytesRead;
-
     BOOL fRead = FALSE;
-
     State state = INIT;
 
     while (1) {
         fRead = ReadFile(ctx->pipeIn, buffer, BUFFER_SIZE, &bytesRead, NULL);
         if (!fRead || bytesRead == 0) {
-			// End loop on error or if the pipe is closing (0 bytes read)
+            // End loop on error or if the pipe is closing (0 bytes read)
             break;
         }
-		buffer[bytesRead] = '\0'; // Null terminate the buffer so we can treat it as a string
-		// State-machine based processing of the output. Handles password entry/verification and supsequent output from the process
+        buffer[bytesRead] = '\0'; // Null terminate the buffer so we can treat it as a string
+        // State-machine based processing of the output. Handles password entry/verification and supsequent output from the process
         state = ProcessOutput(ctx, buffer, bytesRead, state);
         if (state == END) {
             break;
         }
     }
-	// Signal main thread that we are done processing output (either process ended or we got a password failure and are exiting)
+    // Signal main thread that we are done processing output (either process ended or we got a password failure and are exiting)
     SetEvent(ctx->events[0]);
     return 0;
 }
@@ -967,8 +1066,10 @@ static unsigned __stdcall InputHandlerThread(LPVOID arg) {
     else
         mode &= ~ENABLE_PROCESSED_INPUT;                // turn off ENABLE_PROCESSED_INPUT
 	
-    // Allow VT100 ANSI Terminal Escape sequences to be procesed by this console
-    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;              // turn on ENABLE_VIRTUAL_TERMINAL_INPUT
+    // Allow VT100 ANSI Terminal Escape sequences to be procesed by this console (unless command line says no)
+    if (ctx->args.noVT100 == 0)
+        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;              // turn on ENABLE_VIRTUAL_TERMINAL_INPUT
+
     SetConsoleMode(hStdin, mode);
 
     char buffer = 0;
